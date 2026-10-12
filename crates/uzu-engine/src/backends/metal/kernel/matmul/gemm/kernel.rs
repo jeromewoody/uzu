@@ -1,4 +1,7 @@
-use std::collections::{HashMap, hash_map::Entry};
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    sync::Arc,
+};
 
 use super::{
     super::{MatmulOutputWork, supports_integer_right_operand},
@@ -10,10 +13,10 @@ use super::{
 use crate::{
     backends::{
         common::{
-            Backend, BufferMut, BufferRef, CommandBufferEncoding,
+            Backend, BufferMut, BufferRef, CommandBufferEncoding, Context,
             gpu_types::{
                 GemmParams,
-                gemm::{GemmAPrologueKind, GemmAlignment, GemmBPrologueKind, GemmDTransform},
+                gemm::{GemmAPrologueKind, GemmAlignment, GemmBPrologueKind, GemmDTransform, GemmTiling},
             },
             kernel::matmul::{
                 Int8CodeLayout, MatmulA, MatmulArguments, MatmulB, MatmulError, MatmulOutput, MatmulShape,
@@ -25,7 +28,7 @@ use crate::{
             command_buffer::MetalCommandBufferEncoding,
             context::MetalContext,
             error::MetalError,
-            kernel::{GemmMetalKernel, GemmSplitKReduceMetalKernel},
+            kernel::{GemmMetalKernel, GemmSplitKReduceMetalKernel, GemmTileCodesMetalKernel},
         },
     },
     data_type::DataType,
@@ -38,6 +41,8 @@ pub struct GemmKernel {
     trellis: TrellisGemm,
     kernels: HashMap<(GemmSpecialization, DataType), GemmMetalKernel>,
     split_k_reduce: HashMap<(GemmDTransform, DataType), GemmSplitKReduceMetalKernel>,
+    tile_codes: HashMap<u32, GemmTileCodesMetalKernel>,
+    tiled_weights: HashMap<(usize, usize), Arc<<Metal as Backend>::GlobalBuffer>>,
 }
 
 impl GemmKernel {
@@ -57,7 +62,50 @@ impl GemmKernel {
             trellis: TrellisGemm::default(),
             kernels: HashMap::new(),
             split_k_reduce: HashMap::new(),
+            tile_codes: HashMap::new(),
+            tiled_weights: HashMap::new(),
         }
+    }
+
+    fn tiled_weights(
+        &mut self,
+        weights: impl BufferRef<Backend = Metal>,
+        shape: MatmulShape,
+        plan: GemmPlan,
+        command_buffer: &mut MetalCommandBufferEncoding,
+    ) -> Result<Option<Arc<<Metal as Backend>::GlobalBuffer>>, MetalError> {
+        let Some(bits) = shape.b_bits.filter(|bits| matches!(bits, 4 | 8)) else {
+            return Ok(None);
+        };
+        if shape.a_full_precision
+            || plan.engine != GemmEngine::Mxu
+            || plan.tiling != GemmTiling::Tile16x32x256_Simdgroups1x1x4
+        {
+            return Ok(None);
+        }
+        let (buffer, range) = weights.parts();
+        let key = (std::ptr::from_ref(buffer).cast::<()>() as usize, range.start);
+        if let Some(tiled) = self.tiled_weights.get(&key) {
+            return Ok(Some(tiled.clone()));
+        }
+        let row_bytes = shape.k * bits / 8;
+        let row_blocks = shape.n.div_ceil(32);
+        let chunks = shape.k / 32;
+        let lane_bytes = if bits == 4 {
+            16
+        } else {
+            32
+        };
+        let mut tiled =
+            command_buffer.context().create_buffer(row_blocks as usize * chunks as usize * 32 * lane_bytes)?;
+        let kernel = match self.tile_codes.entry(bits) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(GemmTileCodesMetalKernel::new(command_buffer.context(), bits)?),
+        };
+        kernel.encode(weights, &mut tiled, shape.n, row_bytes, row_blocks, chunks, command_buffer);
+        let tiled = Arc::new(tiled);
+        self.tiled_weights.insert(key, tiled.clone());
+        Ok(Some(tiled))
     }
 
     fn get_or_create(
@@ -85,6 +133,7 @@ impl GemmKernel {
                     specialization.output_transform,
                     specialization.alignment,
                     specialization.signed_codes,
+                    specialization.tiled_codes,
                 )?;
                 Ok(entry.insert(kernel))
             },
@@ -357,7 +406,8 @@ impl GemmKernel {
         }
         params.use_morton = use_morton;
 
-        let specialization = GemmSpecialization::from_plan(
+        let tiled = self.tiled_weights(weights, shape, plan, command_buffer)?;
+        let mut specialization = GemmSpecialization::from_plan(
             plan,
             shape,
             self.weights_data_type,
@@ -366,25 +416,46 @@ impl GemmKernel {
             a_prologue,
             a_group_size,
         )?;
+        specialization.tiled_codes = tiled.is_some();
         let kernel = self.get_or_create(command_buffer.context(), specialization, self.output_data_type)?;
-        kernel.encode(
-            a_full_precision,
-            weights,
-            d.reborrow(),
-            scales,
-            biases,
-            zero_points,
-            output_bias,
-            rht_factors,
-            a_int8,
-            a_scales,
-            a_group_sums,
-            std::slice::from_ref(&params),
-            group_count_x,
-            group_count_y,
-            1,
-            command_buffer,
-        );
+        match tiled.as_deref() {
+            Some(tiled) => kernel.encode(
+                a_full_precision,
+                tiled,
+                d.reborrow(),
+                scales,
+                biases,
+                zero_points,
+                output_bias,
+                rht_factors,
+                a_int8,
+                a_scales,
+                a_group_sums,
+                std::slice::from_ref(&params),
+                group_count_x,
+                group_count_y,
+                1,
+                command_buffer,
+            ),
+            None => kernel.encode(
+                a_full_precision,
+                weights,
+                d.reborrow(),
+                scales,
+                biases,
+                zero_points,
+                output_bias,
+                rht_factors,
+                a_int8,
+                a_scales,
+                a_group_sums,
+                std::slice::from_ref(&params),
+                group_count_x,
+                group_count_y,
+                1,
+                command_buffer,
+            ),
+        }
 
         Ok(())
     }
@@ -439,7 +510,8 @@ impl GemmKernel {
         let base_gy = m.div_ceil(tiling.block_m());
         let alignment =
             GemmAlignment::new(m.is_multiple_of(tiling.block_m()), n.is_multiple_of(tiling.block_n()), true);
-        let part_spec = GemmSpecialization::from_plan(
+        let tiled = self.tiled_weights(weights, shape, plan, command_buffer)?;
+        let mut part_spec = GemmSpecialization::from_plan(
             plan,
             shape,
             self.weights_data_type,
@@ -448,6 +520,7 @@ impl GemmKernel {
             a_prologue,
             a_group_size,
         )?;
+        part_spec.tiled_codes = tiled.is_some();
 
         let elem = (m as usize) * (n as usize);
         let partial_data_type = if a_int8.is_some() {
@@ -460,24 +533,44 @@ impl GemmKernel {
         let mut params = gemm_params(shape, plan, 1.0, scale_strides, zero_point_strides);
         params.aligned_inner_iterations = kp / k_step / tiling.simdgroups_k();
         let part_kernel = self.get_or_create(command_buffer.context(), part_spec, partial_data_type)?;
-        part_kernel.encode(
-            a_full_precision,
-            weights,
-            &mut temp,
-            scales,
-            biases,
-            zero_points,
-            None::<&<Metal as Backend>::GlobalBuffer>,
-            None::<&<Metal as Backend>::GlobalBuffer>,
-            a_int8,
-            a_scales,
-            a_group_sums,
-            std::slice::from_ref(&params),
-            base_gx,
-            base_gy,
-            split_k,
-            command_buffer,
-        );
+        match tiled.as_deref() {
+            Some(tiled) => part_kernel.encode(
+                a_full_precision,
+                tiled,
+                &mut temp,
+                scales,
+                biases,
+                zero_points,
+                None::<&<Metal as Backend>::GlobalBuffer>,
+                None::<&<Metal as Backend>::GlobalBuffer>,
+                a_int8,
+                a_scales,
+                a_group_sums,
+                std::slice::from_ref(&params),
+                base_gx,
+                base_gy,
+                split_k,
+                command_buffer,
+            ),
+            None => part_kernel.encode(
+                a_full_precision,
+                weights,
+                &mut temp,
+                scales,
+                biases,
+                zero_points,
+                None::<&<Metal as Backend>::GlobalBuffer>,
+                None::<&<Metal as Backend>::GlobalBuffer>,
+                a_int8,
+                a_scales,
+                a_group_sums,
+                std::slice::from_ref(&params),
+                base_gx,
+                base_gy,
+                split_k,
+                command_buffer,
+            ),
+        }
 
         debug_assert_eq!(elem % 4, 0, "split-K reduce requires M*N divisible by 4");
         let group_count = ((elem as u32) / 4).div_ceil(256);
