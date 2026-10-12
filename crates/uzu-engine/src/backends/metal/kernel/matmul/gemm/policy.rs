@@ -147,6 +147,7 @@ pub(super) fn split_k_target_tiles(
         (true, GemmTiling::Tile32x64x256_Simdgroups2x2, Some(4)) => SPLIT_K_TARGET_TILES_A8_TILE32_W4,
         (true, GemmTiling::Tile32x64x256_Simdgroups2x2, _) => SPLIT_K_TARGET_TILES_A8_TILE32_W8,
         (true, GemmTiling::Tile16x32x256_Simdgroups1x1, _) => SPLIT_K_TARGET_TILES_A8_TILE16X32,
+        (true, GemmTiling::Tile16x32x256_Simdgroups1x1x4, Some(4)) => SPLIT_K_TARGET_TILES_A8,
         (true, GemmTiling::Tile16x32x256_Simdgroups1x1x4, _) => SPLIT_K_TARGET_TILES_A8_TILE16X32_K_SPLIT,
         (true, _, _) => SPLIT_K_TARGET_TILES_A8,
         (false, _, _) => SPLIT_K_TARGET_TILES_FP,
