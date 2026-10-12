@@ -11,7 +11,6 @@ use crate::backends::common::gpu_types::gemm::GemmTiling;
 const MXU_DEFAULT_TILE: GemmTiling = GemmTiling::Tile64x64x256_Simdgroups2x2;
 
 const MXU_SKINNY_M_MAX: u32 = 16;
-const MXU_K_SPLIT_FULL_BLOCK_N_MAX: u32 = 16384;
 const SKINNY_SQUARE_K_MAX: u32 = 2560;
 const READOUT_N_TO_K_RATIO: u32 = 32;
 const WIDE_N_DEEP_K_MIN: u32 = 4096;
@@ -63,9 +62,7 @@ pub(super) fn mxu_int8_gemm_tile(
 ) -> GemmTiling {
     match mxu_mn_tile(true, m, n) {
         GemmTiling::Tile128x128x256_Simdgroups4x4 => MXU_DEFAULT_TILE,
-        GemmTiling::Tile16x32x256_Simdgroups1x1 if m < MXU_SKINNY_M_MAX || n <= MXU_K_SPLIT_FULL_BLOCK_N_MAX => {
-            GemmTiling::Tile16x32x256_Simdgroups1x1x4
-        },
+        GemmTiling::Tile16x32x256_Simdgroups1x1 => GemmTiling::Tile16x32x256_Simdgroups1x1x4,
         tiling => tiling,
     }
 }
