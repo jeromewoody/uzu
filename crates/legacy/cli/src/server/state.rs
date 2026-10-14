@@ -22,7 +22,12 @@ use crate::common::thinking::ThinkingSupport;
 pub struct ModelSlot {
     pub model: Model,
     pub thinking: ThinkingSupport,
-    pub footprint: u64,
+    /// Estimated in-memory footprint in bytes; `None` when it cannot be
+    /// determined (e.g. a local directory that is not scannable). An unknown
+    /// footprint is refused at load time rather than treated as zero — a zero
+    /// estimate would sail through both OOM guards for a model that may be
+    /// tens of gigabytes.
+    pub footprint: Option<u64>,
 }
 
 impl ModelSlot {
@@ -41,8 +46,11 @@ impl ModelSlot {
 
 /// Best-effort estimate of a model's in-memory footprint in bytes: the sum of
 /// its registry file sizes when known; for a local directory, the sum of the
-/// on-disk file sizes; otherwise parameters x bits / 8.
-pub fn footprint_bytes(model: &Model) -> u64 {
+/// on-disk file sizes (or `None` when the directory cannot be scanned);
+/// otherwise parameters x bits / 8. `None` means *unknown*, not zero: the
+/// callers (`load_into`, `memory_guard`) refuse to load an unknown footprint
+/// rather than guard a model at its worst case.
+pub fn footprint_bytes(model: &Model) -> Option<u64> {
     match &model.accessibility {
         ModelAccessibility::OnDevice {
             source: ModelSource::Registry {
@@ -50,7 +58,7 @@ pub fn footprint_bytes(model: &Model) -> u64 {
                 ..
             },
         } if !files.is_empty() => {
-            return files.iter().fold(0_u64, |total, file| total.saturating_add(file.size.max(0) as u64));
+            return Some(files.iter().fold(0_u64, |total, file| total.saturating_add(file.size.max(0) as u64)));
         },
         ModelAccessibility::OnDevice {
             source: ModelSource::Filesystem {
@@ -62,11 +70,13 @@ pub fn footprint_bytes(model: &Model) -> u64 {
         _ => {},
     }
     let Some(properties) = &model.properties else {
-        return 0;
+        // No file sizes, no walkable directory, no parameter count: the size
+        // genuinely cannot be determined.
+        return None;
     };
     let parameters = properties.size.max(0) as u64;
     let bits = model.quantization.as_ref().map_or(16, |quantization| quantization.bits_per_weight as u64);
-    parameters.saturating_mul(bits).div_ceil(8)
+    Some(parameters.saturating_mul(bits).div_ceil(8))
 }
 
 /// Sum of the sizes of every file under `path` (the model's on-disk weight
@@ -77,53 +87,75 @@ pub fn footprint_bytes(model: &Model) -> u64 {
 /// subdirectories like `speculator/` behind links to share them): file links
 /// count their target, directory links are descended into, guarded by a set
 /// of canonical directory paths so a link cycle can't loop the walk forever.
-/// Broken or unreadable entries count as 0; the dynamic free-memory check in
-/// `memory_guard` still bounds what actually gets allocated.
-fn filesystem_bytes(path: &str) -> u64 {
+/// Broken symlinks contribute nothing (there is nothing to map).
+///
+/// `None` means the footprint **cannot be determined**: the path is missing,
+/// or some directory in the tree (including the root) could not be listed or
+/// an entry could not be classified. A `Some(total)` is guaranteed to be the
+/// *complete* count — callers must treat `None` as unknown and refuse to
+/// load, never as zero. This matters because a directory that is searchable
+/// but not listable (e.g. mode `0111`) still lets the engine open its known
+/// `config.json`/`model.safetensors` paths by name, so a zero footprint would
+/// let a large checkpoint through both OOM guards.
+fn filesystem_bytes(path: &str) -> Option<u64> {
     let root = Path::new(path);
-    if !root.is_dir() {
-        return 0;
+    let metadata = std::fs::metadata(root).ok()?;
+    if !metadata.is_dir() {
+        return None;
     }
     let mut total = 0_u64;
     let mut seen_files: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     let mut seen_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     let root_key = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     if !seen_dirs.insert(root_key) {
-        return 0;
+        return None;
     }
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
+        // An unlistable directory (permissions, or a vanished path) means the
+        // total below would be an under-estimate: the walk cannot see what
+        // the engine will map.
         let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
+            return None;
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => return None,
+            };
             let full = entry.path();
             let link_type = match entry.file_type() {
                 Ok(link_type) => link_type,
-                Err(_) => continue,
+                Err(_) => return None,
             };
             // A symlink's own type is reported; stat through it to see the
             // target (this is what `File::open` does for weights).
-            let target = std::fs::metadata(&full).ok();
-            if link_type.is_dir() || (link_type.is_symlink() && target.as_ref().is_some_and(|target| target.is_dir())) {
+            let target = std::fs::metadata(&full);
+            if link_type.is_dir() || (link_type.is_symlink() && target.as_ref().is_ok_and(|target| target.is_dir())) {
                 // Descend (real or symlinked directory); the canonical path
                 // makes a link back to an ancestor a no-op.
                 let key = std::fs::canonicalize(&full).unwrap_or_else(|_| full.clone());
                 if seen_dirs.insert(key) {
                     stack.push(full);
                 }
-            } else if let Some(target) = target.filter(|target| target.is_file()) {
-                // A regular file, or a link to one: count the physical file
-                // once, no matter how many links point at it.
-                let key = std::fs::canonicalize(&full).unwrap_or_else(|_| full.clone());
-                if seen_files.insert(key) {
-                    total = total.saturating_add(target.len());
+            } else if let Ok(target) = target {
+                if target.is_file() {
+                    // A regular file, or a link to one: count the physical
+                    // file once, no matter how many links point at it.
+                    let key = std::fs::canonicalize(&full).unwrap_or_else(|_| full.clone());
+                    if seen_files.insert(key) {
+                        total = total.saturating_add(target.len());
+                    }
                 }
+                // Non-regular targets (a broken link, FIFO, device) are not
+                // weight files: they contribute nothing.
+            } else if !link_type.is_symlink() {
+                // A real file whose size cannot be read: unknown total.
+                return None;
             }
-            // Broken or unreadable entries contribute nothing.
         }
     }
-    total
+    Some(total)
 }
 
 /// Memory in use right now, as reported by the OS.
@@ -401,13 +433,27 @@ impl SessionManager {
         // `memory_guard` regardless of what we free, so evicting the
         // resident model first would just discard its prefix cache for a
         // request that is going to fail anyway.
-        let static_cap_exceeded = static_cap_exceeded(slot.footprint, self.total_memory)
-            && !matches!(slot.model.accessibility, ModelAccessibility::Remote { .. });
+        let is_remote = matches!(slot.model.accessibility, ModelAccessibility::Remote { .. });
+
+        // A *local* model whose footprint cannot be determined (e.g. a
+        // directory that is searchable but not listable, mode `0111`) is
+        // refused rather than guarded at zero bytes: with a zero estimate
+        // both OOM guards would see "~0 GB needed" and a multi-gigabyte
+        // checkpoint could pass and OOM. Remote models allocate nothing
+        // locally, so their (possibly unknown) footprint is not a concern.
+        if !is_remote && slot.footprint.is_none() {
+            return Err(AcquireError::MemoryGuard(format!(
+                "cannot determine the on-disk footprint of local model {}; refusing to load",
+                slot.identifier(),
+            )));
+        }
+        let static_cap_exceeded =
+            slot.footprint.is_some_and(|footprint| static_cap_exceeded(footprint, self.total_memory)) && !is_remote;
         if static_cap_exceeded {
             return Err(AcquireError::MemoryGuard(format!(
                 "model {} needs ~{:.1} GB, over 60% of the {:.1} GB unified memory; refusing to load",
                 slot.identifier(),
-                slot.footprint as f64 / 1e9,
+                slot.footprint.expect("static cap check implies a known footprint") as f64 / 1e9,
                 self.total_memory as f64 / 1e9,
             )));
         }
@@ -421,23 +467,25 @@ impl SessionManager {
         // an API client — so the local-memory OOM guard does not apply to
         // them and is skipped outright (it would otherwise refuse on the
         // fixed 2 GB margin even though nothing is loaded locally).
-        if matches!(slot.model.accessibility, ModelAccessibility::Remote { .. }) {
+        if is_remote {
             return load_model(self, slot, session_slot, liveness).await;
         }
 
+        // A local model with an unknown footprint was already refused above;
+        // unwrap is safe here.
+        let footprint = slot.footprint.expect("local model footprint checked above");
         // OOM guard using live available memory. After a swap the OS may need
         // a moment to reclaim the just-freed pages, so retry briefly. The wait
         // is short (200 ms steps) relative to the keepalive interval, so no
         // liveness race is needed here — the load itself is where the client
         // can disconnect.
-        let mut guard_error =
-            match memory_guard(slot.identifier(), slot.footprint, available_memory(), self.total_memory) {
-                Ok(()) => return load_model(self, slot, session_slot, liveness).await,
-                Err(error) => error,
-            };
+        let mut guard_error = match memory_guard(slot.identifier(), footprint, available_memory(), self.total_memory) {
+            Ok(()) => return load_model(self, slot, session_slot, liveness).await,
+            Err(error) => error,
+        };
         for _ in 0..10 {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            match memory_guard(slot.identifier(), slot.footprint, available_memory(), self.total_memory) {
+            match memory_guard(slot.identifier(), footprint, available_memory(), self.total_memory) {
                 Ok(()) => return load_model(self, slot, session_slot, liveness).await,
                 Err(error) => guard_error = error,
             }
@@ -587,7 +635,8 @@ async fn load_model(
     session_slot: &mut Option<ChatSession>,
     liveness: &mut impl LoadLiveness,
 ) -> Result<ChatSession, AcquireError> {
-    tracing::info!("loading model into memory: {} (~{:.1} GB)", slot.identifier(), slot.footprint as f64 / 1e9);
+    let footprint = slot.footprint.unwrap_or(0);
+    tracing::info!("loading model into memory: {} (~{:.1} GB)", slot.identifier(), footprint as f64 / 1e9);
     // The engine creates the backend in a detached `tokio::spawn` (see
     // `ChatInstance::new`) that awaiting the load future does NOT cancel —
     // if the client goes away mid-load, the backend task keeps allocating
@@ -676,7 +725,7 @@ mod tests {
         // A directory entry must not be counted as a file.
         std::fs::create_dir(root.join("nested/empty")).unwrap();
 
-        assert_eq!(filesystem_bytes(root.to_str().unwrap()), 3072);
+        assert_eq!(filesystem_bytes(root.to_str().unwrap()), Some(3072));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -694,7 +743,7 @@ mod tests {
         // A broken symlink counts as 0, not as a file.
         std::os::unix::fs::symlink(root.join("does-not-exist"), weights_dir.join("broken")).unwrap();
 
-        assert_eq!(filesystem_bytes(root.to_str().unwrap()), 4096);
+        assert_eq!(filesystem_bytes(root.to_str().unwrap()), Some(4096));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -712,7 +761,7 @@ mod tests {
         std::fs::write(speculator.join("model.safetensors"), vec![0u8; 2048]).unwrap();
         std::os::unix::fs::symlink(&speculator, root.join("speculator")).unwrap();
 
-        assert_eq!(filesystem_bytes(root.to_str().unwrap()), 1024 + 2048);
+        assert_eq!(filesystem_bytes(root.to_str().unwrap()), Some(1024 + 2048));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -726,13 +775,38 @@ mod tests {
         // A directory link back to the root must not loop the walk.
         std::os::unix::fs::symlink(&root, root.join("loop")).unwrap();
 
-        assert_eq!(filesystem_bytes(root.to_str().unwrap()), 512);
+        assert_eq!(filesystem_bytes(root.to_str().unwrap()), Some(512));
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn filesystem_bytes_missing_path_is_zero() {
-        assert_eq!(filesystem_bytes("/definitely/not/a/real/path"), 0);
+    fn filesystem_bytes_missing_path_is_unknown() {
+        assert_eq!(filesystem_bytes("/definitely/not/a/real/path"), None);
+    }
+
+    /// A directory that is *searchable* but *not listable* (mode `0111`):
+    /// `stat` and direct `open` of known paths work, but `read_dir` fails.
+    /// The footprint must come back `None` (unknown), never `Some(0)` — a
+    /// zero estimate would let a large checkpoint through the OOM guards.
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_bytes_unlistable_root_is_unknown() {
+        if std::env::var_os("USER").is_some_and(|user| user == "root") {
+            eprintln!("skipping: root bypasses directory listing permissions");
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("uzu-fs-0111-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("model.safetensors"), vec![0u8; 8192]).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o111)).unwrap();
+        let result = filesystem_bytes(root.to_str().unwrap());
+        // Restore permissions before cleanup so the dir can be removed.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(result, None, "an unlistable model dir must report an unknown footprint");
     }
 
     #[test]
