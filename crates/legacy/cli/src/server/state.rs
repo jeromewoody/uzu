@@ -337,11 +337,13 @@ pub struct SessionManager {
     /// only protects the resident session; a request that disconnects mid
     /// load releases that lock but must not be allowed to race a second
     /// backend load against the still-in-flight first one (the engine's
-    /// backend creation runs in a detached `tokio::spawn` that dropping the
-    /// load future does not cancel). `load_model` therefore always runs the
-    /// download+load in a background task that holds this lock for the load's
-    /// full duration, so backend loads never overlap and two large models
-    /// can never be allocated at once.
+    /// backend creation runs in a detached `tokio::spawn` that stopping the
+    /// request does not cancel). `load_model` therefore always runs the
+    /// dynamic-memory guard and the download+load in a background task that
+    /// holds this lock for the whole sequence, so backend loads never
+    /// overlap, two large models can never be allocated at once, and the
+    /// dynamic guard's free-memory sample is taken only after any in-flight
+    /// (possibly abandoned) load has finished and dropped its session.
     load: Arc<Mutex<()>>,
     engine: Arc<Engine>,
     slots: Vec<ModelSlot>,
@@ -465,32 +467,12 @@ impl SessionManager {
 
         // Remote models allocate no local checkpoint — the backend only opens
         // an API client — so the local-memory OOM guard does not apply to
-        // them and is skipped outright (it would otherwise refuse on the
-        // fixed 2 GB margin even though nothing is loaded locally).
-        if is_remote {
-            return load_model(self, slot, session_slot, liveness).await;
-        }
-
-        // A local model with an unknown footprint was already refused above;
-        // unwrap is safe here.
-        let footprint = slot.footprint.expect("local model footprint checked above");
-        // OOM guard using live available memory. After a swap the OS may need
-        // a moment to reclaim the just-freed pages, so retry briefly. The wait
-        // is short (200 ms steps) relative to the keepalive interval, so no
-        // liveness race is needed here — the load itself is where the client
-        // can disconnect.
-        let mut guard_error = match memory_guard(slot.identifier(), footprint, available_memory(), self.total_memory) {
-            Ok(()) => return load_model(self, slot, session_slot, liveness).await,
-            Err(error) => error,
-        };
-        for _ in 0..10 {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            match memory_guard(slot.identifier(), footprint, available_memory(), self.total_memory) {
-                Ok(()) => return load_model(self, slot, session_slot, liveness).await,
-                Err(error) => guard_error = error,
-            }
-        }
-        Err(AcquireError::MemoryGuard(guard_error))
+        // them (it would otherwise refuse on the fixed 2 GB margin even
+        // though nothing is loaded locally). The guard *does* run for local
+        // models — but inside `load_model`, under the load lock, so the
+        // free-memory sample is taken after any in-flight (possibly
+        // abandoned) load has finished and its session has been dropped.
+        load_model(self, slot, session_slot, liveness, !is_remote).await
     }
 
     /// Unloads the resident model when the session has been idle for at least
@@ -629,22 +611,27 @@ fn paths_equal(
 /// load lock until the first model's allocation has actually ended. Backend
 /// loads therefore never overlap, and the single-resident guarantee (and the
 /// OOM it guards) hold across a mid-load disconnect.
+/// `check_memory` selects the dynamic free-memory guard (local models only;
+/// remote backends allocate nothing locally). When set, the guard runs
+/// *inside* the load lock — after any in-flight load has finished and its
+/// session has been dropped — so the sample sees post-abandonment memory.
 async fn load_model(
     manager: &SessionManager,
     slot: &ModelSlot,
     session_slot: &mut Option<ChatSession>,
     liveness: &mut impl LoadLiveness,
+    check_memory: bool,
 ) -> Result<ChatSession, AcquireError> {
     let footprint = slot.footprint.unwrap_or(0);
     tracing::info!("loading model into memory: {} (~{:.1} GB)", slot.identifier(), footprint as f64 / 1e9);
     // The engine creates the backend in a detached `tokio::spawn` (see
-    // `ChatInstance::new`) that awaiting the load future does NOT cancel —
+    // `ChatInstance::new`) that stopping the request does NOT cancel —
     // if the client goes away mid-load, the backend task keeps allocating
     // memory in the background. To keep backend loads globally serialized
     // (so a second model can't start allocating behind an in-flight one), the
     // load ALWAYS runs in a background task that owns the load lock for its
-    // full duration and hands the result back over a oneshot. The request
-    // races that oneshot against liveness: on disconnect it simply stops
+    // full duration and hands the result back over a channel. The request
+    // races that channel against liveness: on disconnect it simply stops
     // waiting (the session lock is released and this function returns), while
     // the background task keeps holding the lock — and the in-flight model
     // stays single-resident, evicted by a later request — until the load
@@ -655,11 +642,53 @@ async fn load_model(
         let model = slot.model.clone();
         let model_id = slot.model.identifier.clone();
         let load_locks = Arc::clone(&manager.load);
+        let total_memory = manager.total_memory;
+        let footprint = slot.footprint;
         tokio::spawn(async move {
-            // Held for the entire backend load. A queued request acquires the
-            // session lock (released on disconnect) but blocks here until
-            // this load has actually finished — no second concurrent load.
+            // Held for the entire dynamic guard and the backend load. A
+            // queued request acquires the session lock (released on
+            // disconnect) but blocks here until this load has actually
+            // finished — no second concurrent load, and no memory sample
+            // taken while an in-flight (possibly abandoned) load still holds
+            // its allocation.
             let _load_lock = load_locks.lock().await;
+            // The client may have disconnected while this task was queued
+            // behind another load: with its receiver gone, nobody is waiting
+            // for this model. Skip the load rather than churning a full
+            // allocation for a result nobody reads (the check runs before
+            // the download starts; a load that already started still runs
+            // to completion).
+            if result_tx.is_closed() {
+                tracing::info!("skipping load of {model_id}: client disconnected before it started");
+                return;
+            }
+            // Dynamic OOM guard, under the load lock: after a swap the OS may
+            // need a moment to reclaim the just-freed pages, so retry briefly
+            // (200 ms steps, up to 2 s).
+            let guard = if check_memory {
+                let footprint = footprint.expect("local model footprint checked above");
+                let mut guard = memory_guard(&model_id, footprint, available_memory(), total_memory);
+                for _ in 0..10 {
+                    if guard.is_ok() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    guard = memory_guard(&model_id, footprint, available_memory(), total_memory);
+                }
+                guard
+            } else {
+                Ok(())
+            };
+            if let Err(error) = guard {
+                let _ = result_tx.send(Err(AcquireError::MemoryGuard(error))).await;
+                return;
+            }
+            // Re-check liveness before starting a multi-second allocation:
+            // the client may have gone away during the guard's retry window.
+            if result_tx.is_closed() {
+                tracing::info!("skipping load of {model_id}: client disconnected before it started");
+                return;
+            }
             let result = async move {
                 let downloader =
                     engine.download(&model).await.map_err(|error| AcquireError::Engine(error.to_string()))?;
